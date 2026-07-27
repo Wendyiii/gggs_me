@@ -20,6 +20,124 @@ from pathlib import Path
 import numpy as np
 
 
+def center_undistorted_principal_points(colmap: str, workspace: Path, output: Path) -> dict:
+    """Shift undistorted images and COLMAP POINTS2D to GGGS's centered principal point."""
+    import cv2
+
+    raw_sparse, raw_images = output / "sparse", output / "images"
+    text_model = workspace / "undistorted_text"
+    centered_binary = workspace / "undistorted_centered_bin"
+    centered_images = workspace / "undistorted_centered_images"
+    text_model.mkdir()
+    centered_binary.mkdir()
+    centered_images.mkdir()
+    run([colmap, "model_converter", "--input_path", str(raw_sparse),
+         "--output_path", str(text_model), "--output_type", "TXT"])
+
+    camera_path = text_model / "cameras.txt"
+    offsets: dict[int, tuple[float, float]] = {}
+    camera_output = []
+    for line in camera_path.read_text(encoding="utf-8").splitlines():
+        fields = line.split()
+        if not fields or fields[0].startswith("#"):
+            camera_output.append(line)
+            continue
+        camera_id, model = int(fields[0]), fields[1]
+        width, height = int(fields[2]), int(fields[3])
+        if model != "PINHOLE" or len(fields) != 8:
+            raise ValueError(
+                f"Expected undistorted PINHOLE camera, got camera {camera_id}: {model}"
+            )
+        fx, fy, cx, cy = map(float, fields[4:8])
+        target_cx, target_cy = (width - 1.0) / 2.0, (height - 1.0) / 2.0
+        offsets[camera_id] = (target_cx - cx, target_cy - cy)
+        camera_output.append(
+            f"{camera_id} PINHOLE {width} {height} "
+            + " ".join(f"{v:.17g}" for v in (fx, fy, target_cx, target_cy))
+        )
+    camera_path.write_text("\n".join(camera_output) + "\n", encoding="utf-8")
+
+    images_path = text_model / "images.txt"
+    lines = images_path.read_text(encoding="utf-8").splitlines()
+    image_output, image_records = [], []
+    index = 0
+    while index < len(lines):
+        line, fields = lines[index], lines[index].split()
+        if not fields or fields[0].startswith("#"):
+            image_output.append(line)
+            index += 1
+            continue
+        if len(fields) < 10 or index + 1 >= len(lines):
+            raise ValueError(f"Malformed images.txt record: {line}")
+        camera_id, image_name = int(fields[8]), " ".join(fields[9:])
+        if camera_id not in offsets:
+            raise ValueError(f"Unknown camera {camera_id} for {image_name}")
+        image_output.append(line)
+        image_records.append((image_name, camera_id))
+        points = lines[index + 1].split()
+        if len(points) % 3:
+            raise ValueError(f"Malformed POINTS2D for {image_name}")
+        dx, dy = offsets[camera_id]
+        shifted = []
+        for j in range(0, len(points), 3):
+            shifted.extend((
+                f"{float(points[j]) + dx:.17g}",
+                f"{float(points[j + 1]) + dy:.17g}",
+                points[j + 2],
+            ))
+        image_output.append(" ".join(shifted))
+        index += 2
+    images_path.write_text("\n".join(image_output) + "\n", encoding="utf-8")
+
+    for image_name, camera_id in image_records:
+        source, destination = raw_images / image_name, centered_images / image_name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        image = cv2.imread(str(source), cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise RuntimeError(f"OpenCV failed to read {source}")
+        height, width = image.shape[:2]
+        dx, dy = offsets[camera_id]
+        matrix = np.asarray([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float64)
+        shifted = cv2.warpAffine(
+            image, matrix, (width, height), flags=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+        params = ([cv2.IMWRITE_JPEG_QUALITY, 100]
+                  if destination.suffix.lower() in {".jpg", ".jpeg"} else [])
+        if not cv2.imwrite(str(destination), shifted, params):
+            raise RuntimeError(f"OpenCV failed to write {destination}")
+
+    run([colmap, "model_converter", "--input_path", str(text_model),
+         "--output_path", str(centered_binary), "--output_type", "BIN"])
+    sparse_backup = workspace / "undistorted_uncentered_sparse"
+    images_backup = workspace / "undistorted_uncentered_images"
+    shutil.move(str(raw_sparse), sparse_backup)
+    shutil.move(str(raw_images), images_backup)
+    shutil.move(str(centered_binary), raw_sparse)
+    shutil.move(str(centered_images), raw_images)
+
+    values = np.asarray(list(offsets.values()), dtype=np.float64)
+    report = {
+        "enabled": True,
+        "target_definition": "((width - 1) / 2, (height - 1) / 2)",
+        "camera_count": len(offsets),
+        "image_count": len(image_records),
+        "border_fill": "black",
+        "interpolation": "OpenCV INTER_LANCZOS4",
+        "dx_min": float(values[:, 0].min()),
+        "dx_max": float(values[:, 0].max()),
+        "dy_min": float(values[:, 1].min()),
+        "dy_max": float(values[:, 1].max()),
+        "max_shift_pixels": float(np.linalg.norm(values, axis=1).max()),
+        "uncentered_sparse_backup": str(sparse_backup),
+        "uncentered_images_backup": str(images_backup),
+    }
+    (output / "principal_point_centering.json").write_text(
+        json.dumps(report, indent=2), encoding="utf-8"
+    )
+    return report
+
+
 def natural_camera_key(name: str) -> tuple[str, int]:
     stem = Path(name).stem
     head, sep, tail = stem.rpartition("_")
@@ -192,6 +310,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-image-size", type=int, default=3200)
     parser.add_argument("--world-scale", type=float, default=1.0,
                         help="Scale applied to world2Cam translation; use 0.001 for mm to m")
+
+    parser.add_argument(
+        "--center-principal-point",
+        action="store_true",
+        help=(
+            "Translate each undistorted image and POINTS2D record so its "
+            "PINHOLE principal point matches GGGS's centered camera model"
+        ),
+    )
     parser.add_argument("--cpu", action="store_true", help="Use CPU SIFT")
     parser.add_argument("--skip-matching", action="store_true",
                         help="Only write and validate the known model")
@@ -294,6 +421,13 @@ def main() -> None:
         "--output_path", str(args.output),
         "--output_type", "COLMAP",
     ])
+
+    if args.center_principal_point:
+        report = center_undistorted_principal_points(
+            args.colmap, args.workspace, args.output
+        )
+        print("\nPrincipal-point centering validation:")
+        print(json.dumps(report, indent=2))
     sparse = args.output / "sparse"
     sparse_zero = sparse / "0"
     sparse_zero.mkdir()
